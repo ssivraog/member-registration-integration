@@ -14,6 +14,108 @@ POST /api/registrations/legacy-payload
 
 The full design, covering every validation rule, error code and the reasoning behind it, is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
+## Architecture
+
+### Deployed view
+
+```mermaid
+flowchart LR
+    subgraph Entra["Entra ID tenant"]
+        API_REG["App registration<br/>api://member-registration<br/>roles: Registrations.Translate,<br/>Registrations.Submit"]
+    end
+
+    CRM["CRM<br/>(Dynamics plugin /<br/>Power Automate)"]
+
+    subgraph FA["Azure Function App (.NET 10 isolated, managed identity)"]
+        AUTHZ["EntraIdInboundAuthorizer<br/>signature · issuer · audience<br/>expiry · app role · caller"]
+        FUNCS["TranslateRegistrationFunction<br/>SubmitRegistrationFunction"]
+        CORE["MemberRegistration.Core<br/>RegistrationTranslator<br/>(parse → validate → map)"]
+        CLIENT["LegacyMembershipClient<br/>resilience → auth handler"]
+        AUTHZ --> FUNCS --> CORE
+        FUNCS --> CLIENT
+    end
+
+    LEGACY["Legacy membership API<br/>(or APIM in front)"]
+    KV["Key Vault<br/>(API key - ApiKey mode only)"]
+    AI["Application Insights<br/>(codes, field names, ids -<br/>no PII, no tokens)"]
+
+    CRM -- "1. client credentials" --> Entra
+    Entra -- "access token" --> CRM
+    CRM -- "2. HTTPS + Bearer token<br/>+ function key" --> AUTHZ
+    CLIENT -- "3. token for legacy scope<br/>(ManagedIdentity mode)" --> Entra
+    KV -. "Key Vault reference" .-> CLIENT
+    CLIENT -- "4. HTTPS + Bearer / X-Api-Key<br/>+ Idempotency-Key + X-Correlation-ID" --> LEGACY
+    FA -. logs .-> AI
+```
+
+### Code layers
+
+```mermaid
+flowchart TB
+    subgraph Functions["src/MemberRegistration.Functions - HTTP host + security"]
+        direction LR
+        F1["TranslateRegistrationFunction<br/>POST /api/registrations/legacy-payload"]
+        F2["SubmitRegistrationFunction<br/>POST /api/registrations"]
+        A["Auth/<br/>EntraIdInboundAuthorizer<br/>InboundAuthOptions + validator"]
+        L["Legacy/<br/>LegacyMembershipClient<br/>BearerTokenHandler · ApiKeyHandler<br/>LegacyApiOptions + validator"]
+        H["Http/HttpSupport<br/>JSON check · 64 KB limit · problem+json"]
+        S["ServiceRegistration<br/>(all DI wiring)"]
+    end
+    subgraph Core["src/MemberRegistration.Core - pure logic, no Azure"]
+        direction LR
+        P["Parsing/<br/>RegistrationReader"]
+        V["Validation/<br/>ErrorCodes · FieldNames"]
+        M["Mapping/<br/>DateOfBirthParser · PlanCodeMapper · EmailRule"]
+        C["Contracts/<br/>LegacyMemberRequest · LegacyJson"]
+        T["RegistrationTranslator"]
+    end
+    F1 --> A
+    F2 --> A
+    F1 --> T
+    F2 --> T
+    F2 --> L
+    T --> P
+    T --> V
+    T --> M
+    T --> C
+```
+
+### Submit request flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CRM
+    participant Entra as Entra ID
+    participant Fn as SubmitRegistrationFunction
+    participant Core as RegistrationTranslator
+    participant Client as LegacyMembershipClient
+    participant Legacy as Legacy API
+
+    CRM->>Entra: client credentials (scope api://member-registration/.default)
+    Entra-->>CRM: access token (roles: Registrations.Submit)
+    CRM->>Fn: POST /api/registrations<br/>Authorization: Bearer, Idempotency-Key, X-Correlation-ID
+    Fn->>Fn: validate token (RS256, issuer, audience, expiry, role, caller)
+    alt token missing/invalid or role missing
+        Fn-->>CRM: 401 / 403 (body never read)
+    end
+    Fn->>Fn: Idempotency-Key present and safe? JSON? ≤ 64 KB?
+    Fn->>Core: Translate(body)
+    alt validation errors
+        Core-->>Fn: Failure(errors)
+        Fn-->>CRM: 400 / 422 problem+json (all errors)
+    end
+    Core-->>Fn: Success(legacy request)
+    Fn->>Client: SubmitAsync(request, idempotency key, correlation id)
+    loop each attempt (resilience: timeouts, retries, circuit breaker)
+        Client->>Entra: token for legacy scope (cached, renewed 5 min early)
+        Client->>Legacy: POST /members (HTTPS + Bearer or X-Api-Key)
+    end
+    Legacy-->>Client: status
+    Client-->>Fn: Accepted / Duplicate / Rejected / AuthFailed / Unavailable
+    Fn-->>CRM: 202 / 409 / 502 / 502 / 503
+```
+
 ## Run it
 
 ```bash
