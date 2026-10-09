@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using MemberRegistration.Core.Validation;
 using MemberRegistration.Functions;
+using MemberRegistration.Functions.Auth;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -12,7 +13,7 @@ namespace MemberRegistration.Tests;
 public class TranslateRegistrationFunctionTests
 {
     private static async Task<ContentResult> PostAsync(string body, string? contentType = "application/json",
-        bool sendContentLength = true)
+        bool sendContentLength = true, StubAuthorizer? authorizer = null)
     {
         var bytes = Encoding.UTF8.GetBytes(body);
         var context = new DefaultHttpContext();
@@ -24,9 +25,31 @@ public class TranslateRegistrationFunctionTests
             context.Request.ContentLength = bytes.Length;
         }
 
-        var function = new TranslateRegistrationFunction(Translator(), NullLogger<TranslateRegistrationFunction>.Instance);
+        var function = new TranslateRegistrationFunction(Translator(), authorizer ?? StubAuthorizer.Allow(),
+            NullLogger<TranslateRegistrationFunction>.Instance);
         var result = await function.Run(context.Request, CancellationToken.None);
-        return Assert.IsType<ContentResult>(result);
+        return Assert.IsType<ContentResult>(result, exactMatch: false);
+    }
+
+    [Fact]
+    public async Task Requires_the_translate_role()
+    {
+        var authorizer = StubAuthorizer.Allow();
+
+        await PostAsync(SampleRegistration, authorizer: authorizer);
+
+        Assert.Equal(AppRoles.Translate, authorizer.RequestedRole);
+    }
+
+    [Fact]
+    public async Task Unauthorized_caller_gets_the_authorizer_response_and_the_body_is_never_read()
+    {
+        var authorizer = StubAuthorizer.Deny(401);
+
+        // An invalid body: if it were read, the response would be 400/422 instead.
+        var result = await PostAsync("{not json", authorizer: authorizer);
+
+        Assert.Equal(401, result.StatusCode);
     }
 
     [Fact]

@@ -223,7 +223,8 @@ public sealed class RegistrationTranslator(TimeProvider clock)
 | | |
 |---|---|
 | Route | `POST /api/registrations/legacy-payload` |
-| Auth level | `Function` (function key). Section 10 covers production |
+| Auth | Entra ID bearer token with app role `Registrations.Translate`, plus the function key (section 11) |
+| 401 / 403 | `application/problem+json`: missing or invalid token / valid token without the role or from a caller not on the allow-list |
 | Request | `Content-Type: application/json`, the CRM registration |
 | 200 | `application/json`, the legacy request body |
 | 400 | `application/problem+json`: the body is empty, not JSON, or not an object |
@@ -277,3 +278,29 @@ Run with `dotnet test`. No external services are needed.
 - **Authentication:** a managed identity gets an Entra ID token for the legacy API, or for APIM in front of it. If the legacy API only supports an API key or basic auth, the secret lives in **Key Vault** and is read through a Key Vault reference, never stored in config.
 - **Inbound:** the function sits behind APIM or uses Entra ID authentication instead of function keys.
 - **Observability:** a correlation id (the CRM record id) is passed to the legacy call as a header and logged. Alerts fire on dead-letter count and circuit-breaker opens.
+
+## 11. Security (implemented)
+
+Authentication on both ends; the README's [Security](../README.md#security) section has the setup steps and settings.
+
+### 11.1 Inbound: `EntraIdInboundAuthorizer`
+
+- Each HTTP function calls `IInboundAuthorizer.AuthorizeAsync(request, role)` **first**, before the body is read, so an unauthenticated caller learns nothing about validation.
+- Token validation in code (`Microsoft.IdentityModel.JsonWebTokens`): signature against the tenant's OpenID signing keys (refreshed once on an unknown key id, for rotation), issuer (tenant, v2.0 and v1.0 forms), audience, expiry (2-minute skew), algorithm RS256 only.
+- Authorization: app role per endpoint (`Registrations.Translate`, `Registrations.Submit`); optional caller app id allow-list.
+- 401 with `WWW-Authenticate: Bearer`; 403 for authenticated-but-not-allowed. The specific reason is logged (exception type, caller app id), never returned; tokens are never logged.
+- Fails closed: the mode defaults to `EntraId`, missing tenant/audience fails startup, and `Disabled` is rejected outside Development.
+- Why in code rather than Easy Auth/APIM only: it works identically locally and in tests, enforces per-endpoint roles, and still composes with APIM or Easy Auth in front.
+
+### 11.2 Outbound: `LegacyMembershipClient`
+
+- New endpoint `POST /api/registrations` (role `Registrations.Submit`, required `Idempotency-Key` header): authorize → translate → submit.
+- Typed `HttpClient`: `AddStandardResilienceHandler` (timeouts, retries with jitter, circuit breaker), then the auth handler **inside** it, so each retry gets a current credential.
+- `BearerTokenHandler`: managed identity token (`DefaultAzureCredential`) for the configured scope, cached and renewed 5 minutes early. `ApiKeyHandler`: key from a Key Vault reference, replacing any existing header.
+- https enforced (http only for localhost in Development); the inbound token is never forwarded.
+- `Idempotency-Key` / `X-Correlation-ID` limited to `[A-Za-z0-9._:-]{1,128}`; an unsafe correlation id is replaced, not forwarded.
+- Only legacy status codes are logged (its bodies may echo PII); its errors and our credential failures are never returned to the caller.
+
+### 11.3 Tests
+
+`InboundAuthorizerTests` (valid, every invalid-token shape incl. `alg: none`, HMAC, wrong key/issuer/audience, expiry, missing role, caller allow-list), `LegacyClientTests` (token scope/caching/renewal, API-key header, headers and body sent, status classification), `SubmitRegistrationFunctionTests`, `AuthOptionsValidatorTests`, and `ServiceRegistrationTests`, which build the real DI container from configuration and check startup refuses unsafe settings.
