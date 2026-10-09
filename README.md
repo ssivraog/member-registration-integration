@@ -12,7 +12,7 @@ POST /api/registrations/legacy-payload
   "contact": { "email": "alex.nguyen@example.com" }, "plan_code": "S", "source": "MILKYWAY" } }
 ```
 
-The full design, covering every validation rule, error code and the reasoning behind it, is in [`docs/DESIGN.md`](docs/DESIGN.md).
+The full design, covering every validation rule, error code and the reasoning behind it, is in [`docs/DESIGN.md`](docs/DESIGN.md). A Word version of the architecture, with a step-by-step guide to running and testing it on another machine, is in [`docs/Architecture-and-Local-Setup.docx`](docs/Architecture-and-Local-Setup.docx).
 
 ## Architecture
 
