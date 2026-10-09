@@ -17,7 +17,7 @@ The full design, covering every validation rule, error code and the reasoning be
 ## Run it
 
 ```bash
-dotnet test                       # 154 tests, no external services needed
+dotnet test                       # 234 tests, no external services needed
 ```
 
 To run the function locally you need [Azure Functions Core Tools v4](https://learn.microsoft.com/azure/azure-functions/functions-run-local) and Azurite, or point `AzureWebJobsStorage` at a storage account:
@@ -85,9 +85,54 @@ services.AddHttpClient<LegacyMembershipClient>(c => c.BaseAddress = new Uri(conf
 
 **Idempotency.** Retries and at-least-once delivery mean the same registration *will* sometimes be sent twice. Send an `Idempotency-Key` header derived from the CRM record id. If the legacy API doesn't support that, check for an existing member by that key before creating one. Without this, retries create duplicate members.
 
-**Authentication.**
-- Preferred: the Function's **managed identity** requests an Entra ID token for the legacy API, or for **APIM** in front of it, using `DefaultAzureCredential`. There are no secrets to store or rotate.
-- If the legacy API only accepts an API key or basic auth, keep the credential in **Key Vault** and surface it to the Function through a Key Vault reference in app settings. Never put it in code or `local.settings.json`. APIM can also inject it, so the Function never sees it.
-- Inbound: replace the function key on this endpoint with Entra ID (Easy Auth), or put it behind APIM.
+**Authentication.** Implemented on both ends - see [Security](#security) below.
 
 **Observability.** Pass a correlation id (the CRM record id) to the legacy call as a header, and log it on both sides. Alert on dead-letter queue depth, circuit-breaker opens and the rate of 4xx responses from the legacy API. A rising 4xx rate usually means the contract has drifted.
+
+## Security
+
+Both ends are authenticated, and the Function refuses to start if either is misconfigured.
+
+### Inbound: CRM → Function (Entra ID bearer tokens)
+
+Every request must carry an **Entra ID access token** for this API, validated in code by `EntraIdInboundAuthorizer` before the body is read:
+
+| Check | Rule |
+|---|---|
+| Signature | RS256 only, against the tenant's published signing keys (fetched from OpenID metadata, refreshed on key rotation). Unsigned (`alg: none`) and HMAC tokens are refused |
+| Issuer | The configured tenant only (v2.0 and v1.0 issuer forms) |
+| Audience | This API (`api://…` or its bare client id) - a token for any other API is refused |
+| Lifetime | Must not be expired; 2-minute clock skew |
+| App role | `Registrations.Translate` for `/registrations/legacy-payload`, `Registrations.Submit` for `/registrations` |
+| Caller | Optional allow-list of caller app ids (`azp`/`appid`) - pin it to the CRM's identity |
+
+401 (with `WWW-Authenticate: Bearer`) for a missing or invalid token, 403 for a valid token without the role or from a caller off the list. Responses never say which check failed; the reason and the caller's app id are logged, the token never is. The **function key stays** as a second layer.
+
+**Entra ID setup:** register an app for this API, set its Application ID URI (e.g. `api://member-registration`), and define the two app roles (allowed member type: *Applications*). Grant the CRM's identity (its managed identity, or the app registration the Dynamics plugin / Power Automate flow uses) the roles it needs as application permissions, with admin consent. The CRM then requests a token for `api://member-registration/.default`.
+
+### Outbound: Function → legacy API
+
+`POST /api/registrations` translates and submits through `LegacyMembershipClient`. Every attempt (including retries) is authenticated by a handler inside the resilience pipeline:
+
+| `LegacyApi:Auth:Mode` | Credential |
+|---|---|
+| `ManagedIdentity` (default) | Entra ID token for `LegacyApi:Auth:Scope` from the Function's managed identity (`DefaultAzureCredential`; set `ManagedIdentityClientId` for a user-assigned one). Cached and renewed 5 minutes before expiry. No secrets anywhere |
+| `ApiKey` | Static key sent in `LegacyApi:Auth:ApiKeyHeader` (default `X-Api-Key`). The value must be a **Key Vault reference** in app settings: `@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/legacy-api-key/)`, with the Function's identity granted *Key Vault Secrets User* |
+| `None` | Development only - for a local stub |
+
+The base URL must be **https**; plain http is only accepted for `localhost` in Development. The caller's own token is never forwarded. Each submission carries the caller's **`Idempotency-Key`** (required, e.g. the CRM record id) and an **`X-Correlation-ID`**; both are restricted to `[A-Za-z0-9._:-]{1,128}` so they can't inject headers or log lines. Legacy responses map to: 2xx → **202**, 409 → **409** (already exists), other 4xx → **502**, 401/403 from the legacy API → **502** (our credential problem, logged as an error, never shown to the caller), timeouts / 5xx after retries / open circuit → **503** (retry with the same `Idempotency-Key`).
+
+### Configuration
+
+| Setting | Example |
+|---|---|
+| `Auth__Inbound__TenantId` | `11111111-2222-3333-4444-555555555555` |
+| `Auth__Inbound__Audience` | `api://member-registration` |
+| `Auth__Inbound__AllowedCallerAppIds__0` | the CRM identity's client id (optional) |
+| `LegacyApi__BaseUrl` | `https://legacy.example.com/api` |
+| `LegacyApi__SubmitPath` | `members` |
+| `LegacyApi__Auth__Mode` | `ManagedIdentity` or `ApiKey` |
+| `LegacyApi__Auth__Scope` | `api://legacy-membership/.default` |
+| `LegacyApi__Auth__ApiKey` | `@Microsoft.KeyVault(SecretUri=…)` (ApiKey mode only) |
+
+Startup fails, naming the setting, if the tenant or audience is missing, the legacy URL isn't https, the scope or key for the chosen mode is missing, or `Disabled`/`None` is used outside Development. `local.settings.json` runs in Development with inbound auth disabled and a local http stub, and holds no secrets.
